@@ -615,4 +615,14 @@ where A: Allocator + Clone + Default
         self.table.clear();
         drop(std::mem::take(&mut self.arena));
     }
+
+    #[inline(always)]
+    unsafe fn prefetch_read_by_hash(&self, hash: u64) {
+        self.table.prefetch_read_by_hash(hash);
+    }
+
+    #[inline(always)]
+    unsafe fn prefetch_write_by_hash(&self, hash: u64) {
+        self.table.prefetch_write_by_hash(hash);
+    }
 }

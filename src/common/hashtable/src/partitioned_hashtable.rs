@@ -171,6 +171,18 @@ impl<K: ?Sized + FastHash, V, Impl: HashtableLike<Key = K, Value = V>, const BUC
             inner_table.clear();
         }
     }
+
+    #[inline(always)]
+    unsafe fn prefetch_read_by_hash(&self, hash: u64) {
+        let index = hash as usize >> (64u32 - BUCKETS_LG2);
+        self.tables[index].prefetch_read_by_hash(hash);
+    }
+
+    #[inline(always)]
+    unsafe fn prefetch_write_by_hash(&self, hash: u64) {
+        let index = hash as usize >> (64u32 - BUCKETS_LG2);
+        self.tables[index].prefetch_write_by_hash(hash);
+    }
 }
 
 pub struct PartitionedHashtableIter<Impl> {

@@ -14,6 +14,9 @@
 
 use common_hashtable::HashtableLike;
 
+/// This is an emprical value.
+pub const HASH_MAP_PREFETCH_DIST: usize = 16;
+
 #[inline]
 pub fn estimated_key_size<Table: HashtableLike>(table: &Table) -> usize {
     table.unsize_key_size().unwrap_or_default()

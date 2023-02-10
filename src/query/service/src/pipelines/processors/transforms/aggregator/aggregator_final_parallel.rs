@@ -15,6 +15,7 @@
 use std::borrow::BorrowMut;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::intrinsics::likely;
 use std::sync::Arc;
 use std::vec;
 
@@ -33,6 +34,7 @@ use tracing::info;
 
 use super::estimated_key_size;
 use super::AggregateHashStateInfo;
+use super::HASH_MAP_PREFETCH_DIST;
 use crate::pipelines::processors::transforms::aggregator::aggregate_info::AggregateInfo;
 use crate::pipelines::processors::transforms::group_by::Area;
 use crate::pipelines::processors::transforms::group_by::ArenaHolder;
@@ -179,6 +181,22 @@ where Method: HashMethod + PolymorphicKeysHelper<Method> + Send + 'static
         })
     }
 
+    #[inline(always)]
+    fn merge_keys_with_prefetch(
+        &mut self,
+        keys_with_hash: &[(&<Method as HashMethod>::HashKey, u64)],
+    ) {
+        let len = keys_with_hash.len();
+        unsafe {
+            for (i, (key, hash)) in keys_with_hash.iter().enumerate() {
+                if likely(i + HASH_MAP_PREFETCH_DIST < len) {
+                    self.hash_table.prefetch_read_by_hash(*hash);
+                }
+                let _ = self.hash_table.insert_and_entry_with_hash(key, *hash);
+            }
+        }
+    }
+
     fn merge_partial_hashstates(&mut self, hashtable: &mut Method::HashTable) -> Result<()> {
         // Note: We can't swap the ptr here, there maybe some bugs if the original hashtable
         // if self.hash_table.len() == 0 {
@@ -187,24 +205,27 @@ where Method: HashMethod + PolymorphicKeysHelper<Method> + Send + 'static
         // }
 
         if !HAS_AGG {
-            unsafe {
-                for key in hashtable.iter() {
-                    let _ = self.hash_table.insert_and_entry(key.key());
-                }
-                if let Some(limit) = self.params.limit {
-                    if self.hash_table.len() >= limit {
-                        return Ok(());
-                    }
-                }
-            }
+            let keys_with_hash = hashtable
+                .iter()
+                .map(|e| (e.key(), self.method.get_hash(e.key())))
+                .collect::<Vec<_>>();
+            self.merge_keys_with_prefetch(&keys_with_hash);
         } else {
+            let entries_with_hash = hashtable
+                .iter()
+                .map(|e| (e, self.method.get_hash(e.key())))
+                .collect::<Vec<_>>();
+
             let aggregate_functions = &self.params.aggregate_functions;
             let offsets_aggregate_states = &self.params.offsets_aggregate_states;
 
-            for entry in hashtable.iter() {
-                let key = entry.key();
-                unsafe {
-                    match self.hash_table.insert(key) {
+            let len = entries_with_hash.len();
+            unsafe {
+                for (i, (entry, hash)) in entries_with_hash.iter().enumerate() {
+                    if likely(i + HASH_MAP_PREFETCH_DIST < len) {
+                        self.hash_table.prefetch_read_by_hash(*hash);
+                    }
+                    match self.hash_table.insert_with_hash(entry.key(), *hash) {
                         Ok(e) => {
                             // just set new places and the arena will be keeped in partial state
                             e.write(*entry.get());
@@ -227,7 +248,7 @@ where Method: HashMethod + PolymorphicKeysHelper<Method> + Send + 'static
                 }
             }
         }
-        hashtable.clear();
+
         Ok(())
     }
 
@@ -242,6 +263,11 @@ where Method: HashMethod + PolymorphicKeysHelper<Method> + Send + 'static
                     let hashtable = info.hash_state.downcast_mut::<Method::HashTable>().unwrap();
                     self.state_holders.push(info.state_holder.take());
                     self.merge_partial_hashstates(hashtable)?;
+                    if let Some(limit) = self.params.limit {
+                        if self.hash_table.len() >= limit {
+                            break;
+                        }
+                    }
                     continue;
                 }
             }
@@ -257,15 +283,14 @@ where Method: HashMethod + PolymorphicKeysHelper<Method> + Send + 'static
             let keys_iter = self.method.keys_iter_from_column(keys_column)?;
 
             if !HAS_AGG {
-                unsafe {
-                    for key in keys_iter.iter() {
-                        let _ = self.hash_table.insert_and_entry(key);
-                    }
-
-                    if let Some(limit) = self.params.limit {
-                        if self.hash_table.len() >= limit {
-                            break;
-                        }
+                let keys_with_hash = keys_iter
+                    .iter()
+                    .map(|key| (key, self.method.get_hash(key)))
+                    .collect::<Vec<_>>();
+                self.merge_keys_with_prefetch(&keys_with_hash);
+                if let Some(limit) = self.params.limit {
+                    if self.hash_table.len() >= limit {
+                        break;
                     }
                 }
             } else {
@@ -366,13 +391,21 @@ where Method: HashMethod + PolymorphicKeysHelper<Method> + Send + 'static
     /// Allocate aggregation function state for each key(the same key can always get the same state)
     #[inline(always)]
     fn lookup_state(&mut self, keys_iter: &Method::KeysColumnIter) -> Vec<(usize, StateAddr)> {
-        let iter = keys_iter.iter();
-        let (len, _) = iter.size_hint();
+        let keys_with_hash = keys_iter
+            .iter()
+            .map(|key| (key, self.method.get_hash(key)))
+            .collect::<Vec<_>>();
+
+        let len = keys_with_hash.len();
         let mut places = Vec::with_capacity(len);
 
         let mut current_len = self.hash_table.len();
         unsafe {
-            for (row, key) in iter.enumerate() {
+            for (row, (key, hash)) in keys_with_hash.iter().enumerate() {
+                if likely(row + HASH_MAP_PREFETCH_DIST < len) {
+                    self.hash_table.prefetch_read_by_hash(*hash);
+                }
+
                 if self.reach_limit {
                     let entry = self.hash_table.entry(key);
                     if let Some(entry) = entry {
@@ -382,7 +415,7 @@ where Method: HashMethod + PolymorphicKeysHelper<Method> + Send + 'static
                     continue;
                 }
 
-                match self.hash_table.insert_and_entry(key) {
+                match self.hash_table.insert_and_entry_with_hash(key, *hash) {
                     Ok(mut entry) => {
                         let place = self.params.alloc_layout(&mut self.area);
                         places.push((row, place));

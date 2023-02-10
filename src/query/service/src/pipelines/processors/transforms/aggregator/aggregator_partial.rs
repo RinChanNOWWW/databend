@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::intrinsics::likely;
 use std::sync::Arc;
 
 use common_exception::Result;
@@ -27,6 +28,7 @@ use common_hashtable::HashtableEntryRefLike;
 use common_hashtable::HashtableLike;
 
 use super::estimated_key_size;
+use super::HASH_MAP_PREFETCH_DIST;
 use crate::pipelines::processors::transforms::group_by::Area;
 use crate::pipelines::processors::transforms::group_by::ArenaHolder;
 use crate::pipelines::processors::transforms::group_by::KeysColumnBuilder;
@@ -74,29 +76,40 @@ impl<const HAS_AGG: bool, Method: HashMethod + PolymorphicKeysHelper<Method> + S
     }
 
     #[inline(always)]
-    fn lookup_key(keys_iter: Method::HashKeyIter<'_>, hashtable: &mut Method::HashTable) {
+    fn lookup_key(&mut self, keys_iter: Method::HashKeyIter<'_>) {
+        let keys_with_hash = keys_iter
+            .map(|key| (key, self.method.get_hash(key)))
+            .collect::<Vec<_>>();
+        let len = keys_with_hash.len();
         unsafe {
-            for key in keys_iter {
-                let _ = hashtable.insert_and_entry(key);
+            for (i, (key, hash)) in keys_with_hash.iter().enumerate() {
+                if likely(i + HASH_MAP_PREFETCH_DIST < len) {
+                    self.hash_table.prefetch_read_by_hash(*hash);
+                }
+                let _ = self.hash_table.insert_and_entry_with_hash(key, *hash);
             }
         }
     }
 
     /// Allocate aggregation function state for each key(the same key can always get the same state)
     #[inline(always)]
-    fn lookup_state(
-        area: &mut Area,
-        params: &Arc<AggregatorParams>,
-        keys_iter: Method::HashKeyIter<'_>,
-        hashtable: &mut Method::HashTable,
-    ) -> StateAddrs {
-        let mut places = Vec::with_capacity(keys_iter.size_hint().0);
+    fn lookup_state(&mut self, keys_iter: Method::HashKeyIter<'_>) -> StateAddrs {
+        let keys_with_hash = keys_iter
+            .map(|key| (key, self.method.get_hash(key)))
+            .collect::<Vec<_>>();
+        let len = keys_with_hash.len();
+        let mut places = Vec::with_capacity(len);
+        let area = self.area.as_mut().unwrap();
 
         unsafe {
-            for key in keys_iter {
-                match hashtable.insert_and_entry(key) {
+            for (i, (key, hash)) in keys_with_hash.iter().enumerate() {
+                if likely(i + HASH_MAP_PREFETCH_DIST < len) {
+                    self.hash_table.prefetch_read_by_hash(*hash);
+                }
+
+                match self.hash_table.insert_and_entry_with_hash(key, *hash) {
                     Ok(mut entry) => {
-                        let place = params.alloc_layout(area);
+                        let place = self.params.alloc_layout(area);
                         places.push(place);
                         *entry.get_mut() = place.addr();
                     }
@@ -252,12 +265,10 @@ impl<const HAS_AGG: bool, Method: HashMethod + PolymorphicKeysHelper<Method> + S
         let group_keys_iter = self.method.build_keys_iter(&group_keys_state)?;
 
         if HAS_AGG {
-            let area = self.area.as_mut().unwrap();
-            let places =
-                Self::lookup_state(area, &self.params, group_keys_iter, &mut self.hash_table);
+            let places = self.lookup_state(group_keys_iter);
             Self::execute(&self.params, &block, &places)
         } else {
-            Self::lookup_key(group_keys_iter, &mut self.hash_table);
+            self.lookup_key(group_keys_iter);
             Ok(())
         }
     }
